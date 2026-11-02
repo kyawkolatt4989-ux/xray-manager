@@ -1,47 +1,87 @@
 
-
 'use strict';
 
-const $ = (id) => document.getElementById(id);
+const $ = id => document.getElementById(id);
 
 let currentPage = 'dashboard';
 let usersCache = [];
 
+const TOKEN_KEY = 'xray_manager_token';
+
+function getToken() {
+  return sessionStorage.getItem(TOKEN_KEY) || '';
+}
+
 async function api(url, options = {}) {
+  const headers = {
+    ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+    ...(options.headers || {})
+  };
+
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
   const response = await fetch(url, {
-    credentials: 'same-origin',
     ...options,
-    headers: {
-      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(options.headers || {})
-    }
+    headers,
+    credentials: 'same-origin'
   });
 
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(data.message || data.error || `Request failed (${response.status})`);
+    if (response.status === 401) {
+      sessionStorage.removeItem(TOKEN_KEY);
+      setLoggedIn(false);
+    }
+
+    throw new Error(data.error || data.message || `HTTP ${response.status}`);
   }
 
   return data;
 }
 
-function showMessage(element, message) {
-  if (element) element.textContent = message || '';
+function setText(id, value) {
+  const element = $(id);
+  if (element) element.textContent = value ?? '-';
+}
+
+function formatUptime(seconds) {
+  if (!Number.isFinite(Number(seconds))) return '-';
+
+  const total = Math.floor(Number(seconds));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+
+  return `${days}d ${hours}h ${minutes}m`;
+}
+
+function formatMemory(bytes) {
+  if (!Number.isFinite(Number(bytes))) return '-';
+
+  const gb = Number(bytes) / (1024 ** 3);
+  return `${gb.toFixed(2)} GB`;
 }
 
 function formatDate(value) {
   if (!value) return 'No expiry';
 
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return String(value);
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value;
 
   return date.toLocaleDateString();
 }
 
-function setText(id, value) {
-  const element = $(id);
-  if (element) element.textContent = value ?? '-';
+function setLoggedIn(loggedIn) {
+  $('loginPage').hidden = loggedIn;
+  $('panel').hidden = !loggedIn;
+
+  $('sidebar').style.display = loggedIn ? '' : 'none';
+
+  if (loggedIn) {
+    showPage('dashboard');
+  }
 }
 
 function showPage(page) {
@@ -52,8 +92,7 @@ function showPage(page) {
   currentPage = page;
 
   pages.forEach(name => {
-    const section = $(`${name}Page`);
-    if (section) section.hidden = name !== page;
+    $(`${name}Page`).hidden = name !== page;
   });
 
   document.querySelectorAll('.nav').forEach(button => {
@@ -65,19 +104,7 @@ function showPage(page) {
   if (page === 'dashboard') loadDashboard();
   if (page === 'users') loadUsers();
 
-  $('sidebar')?.classList.remove('open');
-}
-
-function setLoggedIn(loggedIn) {
-  const loginPage = $('loginPage');
-  const panel = $('panel');
-  const sidebar = $('sidebar');
-
-  if (loginPage) loginPage.hidden = loggedIn;
-  if (panel) panel.hidden = !loggedIn;
-  if (sidebar) sidebar.style.display = loggedIn ? '' : 'none';
-
-  if (loggedIn) showPage('dashboard');
+  $('sidebar').classList.remove('open');
 }
 
 async function login(event) {
@@ -87,29 +114,28 @@ async function login(event) {
   const button = form.querySelector('button[type="submit"]');
   const error = $('loginError');
 
-  showMessage(error, '');
+  error.textContent = '';
 
   const username = form.elements.username.value.trim();
   const password = form.elements.password.value;
-
-  if (!username || !password) {
-    showMessage(error, 'Enter username and password.');
-    return;
-  }
 
   button.disabled = true;
   button.textContent = 'Signing in...';
 
   try {
-    await api('/api/login', {
+    const data = await api('/api/login', {
       method: 'POST',
       body: JSON.stringify({ username, password })
     });
 
+    if (!data.token) throw new Error('Login token was not received.');
+
+    sessionStorage.setItem(TOKEN_KEY, data.token);
+
     form.reset();
     setLoggedIn(true);
   } catch (err) {
-    showMessage(error, err.message || 'Login failed.');
+    error.textContent = err.message;
   } finally {
     button.disabled = false;
     button.textContent = 'Sign In';
@@ -123,55 +149,74 @@ async function logout() {
     console.error(err);
   }
 
+  sessionStorage.removeItem(TOKEN_KEY);
   setLoggedIn(false);
-  showMessage($('loginError'), '');
 }
 
-function unwrap(data) {
-  return data?.data || data?.result || data || {};
+async function checkLogin() {
+  if (!getToken()) {
+    setLoggedIn(false);
+    return;
+  }
+
+  try {
+    await api('/api/me');
+    setLoggedIn(true);
+  } catch {
+    sessionStorage.removeItem(TOKEN_KEY);
+    setLoggedIn(false);
+  }
 }
 
 async function loadDashboard() {
   try {
-    const response = await api('/api/dashboard');
-    const data = unwrap(response);
+    const data = await api('/api/dashboard');
 
-    const stats = data.stats || data;
-    const system = data.system || data.server || {};
+    const users = data.users || {};
+    const system = data.system || {};
+    const xray = data.xray || {};
 
-    setText('totalUsers', stats.totalUsers ?? stats.total ?? 0);
-    setText('enabledUsers', stats.enabledUsers ?? stats.enabled ?? 0);
-    setText('disabledUsers', stats.disabledUsers ?? stats.disabled ?? 0);
+    setText('totalUsers', users.total ?? 0);
+    setText('enabledUsers', users.enabled ?? 0);
+    setText('disabledUsers', users.disabled ?? 0);
+    setText('cpuCores', system.cpuCores ?? '-');
 
-    setText('cpuCores', system.cpuCores ?? system.cpus ?? '-');
     setText('hostname', system.hostname ?? '-');
     setText('platform', system.platform ?? '-');
-    setText('uptime', system.uptime ?? '-');
-    setText('memory', system.memoryUsage ?? system.memory ?? '-');
+    setText('uptime', formatUptime(system.uptime));
+
+    const memoryUsed = 100 - (
+      Number(system.memoryFree || 0) /
+      Math.max(Number(system.memoryTotal || 1), 1) * 100
+    );
+
+    setText(
+      'memory',
+      `${Math.round(memoryUsed)}% (${formatMemory(system.memoryTotal)})`
+    );
 
     setText(
       'xrayStatus',
-      data.xray?.status || data.xrayStatus || 'Not Connected'
+      xray.connected ? 'Connected' : 'Not Connected'
     );
 
     setText(
       'xrayMessage',
-      data.xray?.message ||
-      data.message ||
-      'Xray Core integration is not configured yet.'
+      xray.message || 'Xray Core integration is not configured yet.'
     );
+
   } catch (err) {
-    console.error('Dashboard:', err);
+    console.error('Dashboard error:', err);
   }
 }
 
-function createCell(text) {
-  const td = document.createElement('td');
-  td.textContent = text ?? '-';
-  return td;
+function createCell(value) {
+  const cell = document.createElement('td');
+  cell.textContent = value ?? '-';
+  return cell;
 }
 
-function createActionButton(label, className, handler) {
+function createButton(label, className, handler) {
   const button = document.createElement('button');
   button.type = 'button';
   button.textContent = label;
@@ -182,8 +227,6 @@ function createActionButton(label, className, handler) {
 
 function renderUsers(users) {
   const tbody = $('userRows');
-  if (!tbody) return;
-
   tbody.replaceChildren();
 
   if (!users.length) {
@@ -200,35 +243,36 @@ function renderUsers(users) {
 
     row.appendChild(createCell(user.username));
     row.appendChild(createCell(String(user.protocol || '').toUpperCase()));
-    row.appendChild(createCell(user.uuid || user.id || '-'));
-    row.appendChild(createCell(formatDate(user.expiresAt)));
+    row.appendChild(createCell(user.uuid));
+    row.appendChild(createCell(formatDate(user.expires_at)));
 
-    const status = user.enabled === false ? 'Disabled' : 'Enabled';
-    row.appendChild(createCell(status));
+    row.appendChild(
+      createCell(user.enabled ? 'Enabled' : 'Disabled')
+    );
 
     const actions = document.createElement('td');
 
     actions.appendChild(
-      createActionButton(
-        user.enabled === false ? 'Enable' : 'Disable',
+      createButton(
+        user.enabled ? 'Disable' : 'Enable',
         'secondary',
         () => toggleUser(user)
       )
     );
 
     actions.appendChild(
-      createActionButton(
-        'Delete',
-        'danger',
-        () => deleteUser(user)
+      createButton(
+        'QR',
+        'secondary',
+        () => showQR(user)
       )
     );
 
     actions.appendChild(
-      createActionButton(
-        'QR',
-        'secondary',
-        () => showQR(user)
+      createButton(
+        'Delete',
+        'danger',
+        () => deleteUser(user)
       )
     );
 
@@ -239,25 +283,16 @@ function renderUsers(users) {
 
 async function loadUsers() {
   const tbody = $('userRows');
-  if (tbody) tbody.textContent = 'Loading users...';
+  tbody.textContent = 'Loading users...';
 
   try {
-    const response = await api('/api/users');
-    const data = unwrap(response);
+    const data = await api('/api/users');
 
-    usersCache = Array.isArray(data)
-      ? data
-      : Array.isArray(data.users)
-        ? data.users
-        : [];
-
+    usersCache = Array.isArray(data.users) ? data.users : [];
     renderUsers(usersCache);
-  } catch (err) {
-    console.error('Users:', err);
 
-    if (tbody) {
-      tbody.textContent = `Unable to load users: ${err.message}`;
-    }
+  } catch (err) {
+    tbody.textContent = `Unable to load users: ${err.message}`;
   }
 }
 
@@ -273,7 +308,7 @@ async function createUser(event) {
   const expiresAt = form.elements.expiresAt.value || null;
 
   if (username.length < 3) {
-    alert('Username must be at least 3 characters.');
+    alert('Username must contain at least 3 characters.');
     return;
   }
 
@@ -302,45 +337,48 @@ async function createUser(event) {
     await loadDashboard();
 
     alert('User record created successfully.');
+
   } catch (err) {
-    alert(err.message || 'Unable to create user.');
+    alert(err.message);
   } finally {
     button.disabled = false;
   }
 }
 
 async function toggleUser(user) {
-  const nextState = user.enabled === false;
+  const enabled = !Boolean(user.enabled);
 
-  if (!confirm(`${nextState ? 'Enable' : 'Disable'} ${user.username}?`)) {
+  if (!confirm(`${enabled ? 'Enable' : 'Disable'} ${user.username}?`)) {
     return;
   }
 
   try {
-    await api(`/api/users/${encodeURIComponent(user.id)}`, {
+    await api(`/api/users/${user.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ enabled: nextState })
+      body: JSON.stringify({ enabled })
     });
 
     await loadUsers();
     await loadDashboard();
+
   } catch (err) {
     alert(err.message);
   }
 }
 
 async function deleteUser(user) {
-  if (!confirm(`Delete user "${user.username}"? This cannot be undone.`)) {
+  if (!confirm(`Delete ${user.username}? This cannot be undone.`)) {
     return;
   }
 
   try {
-    await api(`/api/users/${encodeURIComponent(user.id)}`, {
+    await api(`/api/users/${user.id}`, {
       method: 'DELETE'
     });
 
     await loadUsers();
     await loadDashboard();
+
   } catch (err) {
     alert(err.message);
   }
@@ -348,29 +386,36 @@ async function deleteUser(user) {
 
 async function showQR(user) {
   try {
-    const response = await api(
-      `/api/users/${encodeURIComponent(user.id)}/qr`
-    );
+    const data = await api(`/api/users/${user.id}/qr`);
 
-    const data = unwrap(response);
+    if (!data.qr) throw new Error('QR image not received.');
 
-    const value = data.qr || data.qrCode || data.data || JSON.stringify(data);
+    const popup = window.open('', '_blank');
 
-    alert(
-      'QR endpoint response received.\n\n' +
-      (typeof value === 'string' ? value : JSON.stringify(value))
-    );
+    if (!popup) {
+      alert('Please allow pop-ups to display the QR code.');
+      return;
+    }
+
+    const image = popup.document.createElement('img');
+    image.src = data.qr;
+    image.alt = `QR code for ${user.username}`;
+    image.style.cssText = 'max-width:90%;display:block;margin:30px auto;';
+
+    popup.document.body.appendChild(image);
+    popup.document.title = `QR - ${user.username}`;
+
   } catch (err) {
-    alert(`QR unavailable: ${err.message}`);
+    alert(err.message);
   }
 }
 
 function setupEvents() {
-  $('loginForm')?.addEventListener('submit', login);
-  $('logout')?.addEventListener('click', logout);
+  $('loginForm').addEventListener('submit', login);
+  $('logout').addEventListener('click', logout);
 
-  $('menuBtn')?.addEventListener('click', () => {
-    $('sidebar')?.classList.toggle('open');
+  $('menuBtn').addEventListener('click', () => {
+    $('sidebar').classList.toggle('open');
   });
 
   document.querySelectorAll('.nav').forEach(button => {
@@ -379,28 +424,19 @@ function setupEvents() {
     });
   });
 
-  $('refreshBtn')?.addEventListener('click', loadDashboard);
-  $('reloadUsers')?.addEventListener('click', loadUsers);
+  $('refreshBtn').addEventListener('click', loadDashboard);
+  $('reloadUsers').addEventListener('click', loadUsers);
 
-  $('showCreate')?.addEventListener('click', () => {
+  $('showCreate').addEventListener('click', () => {
     $('createBox').hidden = false;
   });
 
-  $('cancelCreate')?.addEventListener('click', () => {
+  $('cancelCreate').addEventListener('click', () => {
     $('createBox').hidden = true;
-    $('userForm')?.reset();
+    $('userForm').reset();
   });
 
-  $('userForm')?.addEventListener('submit', createUser);
-}
-
-async function checkLogin() {
-  try {
-    await api('/api/me');
-    setLoggedIn(true);
-  } catch {
-    setLoggedIn(false);
-  }
+  $('userForm').addEventListener('submit', createUser);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
