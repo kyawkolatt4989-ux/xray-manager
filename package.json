@@ -7,7 +7,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js"
+    "check": "node --check server.js && node --check xray.js && node --check public/app.js"
   },
   "engines": {
     "node": ">=20"
